@@ -266,7 +266,7 @@ class FleetOrchestrator:
             enabled=magnetometers > 0, n_nodes=max(magnetometers, 0), placement=mag_placement
         )
         self.magnetometers: MagnetometerArray | None = None
-        self._last_flyby_seq = 0
+        self._last_flyby_at = 0.0
         self.cells = cells or []
         self.metro = metro
         self.host = host
@@ -1152,19 +1152,24 @@ def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: f
     if not isinstance(request, dict):
         return None
     seq = request.get("seq")
-    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= orchestrator._last_flyby_seq:
-        return None
-    orchestrator._last_flyby_seq = seq
     requested_at = request.get("requested_at")
-    if not isinstance(requested_at, (int, float)) or now - requested_at > FLYBY_MAX_AGE_S:
-        log.info("Ignoring stale UAP flyby request #%d", seq)
+    if isinstance(requested_at, bool) or not isinstance(requested_at, (int, float)):
+        return None
+    # Each request is flown once. Its time says whether it is new, not its
+    # number: the server numbers requests afresh when it restarts, and a fleet
+    # that kept running would take every request after that for an old one.
+    if requested_at <= orchestrator._last_flyby_at:
+        return None
+    orchestrator._last_flyby_at = requested_at
+    if now - requested_at > FLYBY_MAX_AGE_S:
+        log.info("Ignoring stale UAP flyby request #%s", seq)
         return None
     if not array.nodes:
-        log.warning("UAP flyby #%d requested with no magnetometers placed", seq)
+        log.warning("UAP flyby #%s requested with no magnetometers placed", seq)
         return None
     target = next((n for n in array.nodes if request.get("node_id") in (n.node_id, n.host_node_id)), None)
     if target is None:
-        target = array.nodes[int(uniform(orchestrator.seed, "flyby-target", seq) * len(array.nodes))]
+        target = array.nodes[int(uniform(orchestrator.seed, "flyby-target", requested_at) * len(array.nodes))]
 
     def number(key, default, low, high):
         value = request.get(key)
@@ -1174,7 +1179,7 @@ def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: f
 
     heading = request.get("heading_deg")
     if isinstance(heading, bool) or not isinstance(heading, (int, float)):
-        heading = 360.0 * uniform(orchestrator.seed, "flyby-heading", seq)
+        heading = 360.0 * uniform(orchestrator.seed, "flyby-heading", requested_at)
     ac = orchestrator.world.inject_uap_flyby(
         target.lat,
         target.lon,
@@ -1186,7 +1191,7 @@ def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: f
         lead_s=number("lead_s", 60.0, 10.0, 600.0),
     )
     log.info(
-        "UAP flyby #%d: %s passes %s (%s) in %.0f s",
+        "UAP flyby #%s: %s passes %s (%s) in %.0f s",
         seq,
         ac.object_id,
         target.node_id,

@@ -259,9 +259,23 @@ class TestFlyby:
         }
         ac = apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 1)
         assert ac is not None and ac in orch.world.aircraft
-        assert apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 2) is None  # same seq
+        assert apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 2) is None  # the same request
         stale = {**request, "seq": 4, "requested_at": T0 - 1000}
         assert apply_magnetometer_config(orch, {"mag_flyby": stale}, T0 + 3) is None
+
+    def test_a_request_numbered_afresh_by_a_restarted_server_is_still_flown(self):
+        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+
+        orch = FleetOrchestrator(
+            node_configs=[{**c, "tx_lat": 34.0, "tx_lon": -82.0, "tx_alt_ft": 1000, "fc_hz": 1e8} for c in FLEET],
+            seed=1,
+        )
+        orch._build_world()
+        first = {"seq": 5, "requested_at": T0, "closest_approach_m": 500}
+        assert apply_magnetometer_config(orch, {"mag_flyby": first}, T0 + 1) is not None
+        # The server restarted and counts from one again; the fleet did not.
+        after_restart = {"seq": 1, "requested_at": T0 + 30, "closest_approach_m": 500}
+        assert apply_magnetometer_config(orch, {"mag_flyby": after_restart}, T0 + 31) is not None
 
     def test_orchestrator_replaces_magnetometers_from_config(self):
         from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
