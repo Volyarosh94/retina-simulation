@@ -223,6 +223,13 @@ class SimulatedAircraft:
     # for _LIVE_ALT_ADOPT_S — from the feed flipping between several other
     # aircraft's levels, which is never a re-level and must never be adopted.
     live_alt_reject_km: float = 0.0
+    # A scripted object flies a fixed straight line at constant speed: no
+    # waypoints, no erratic manoeuvres, no separation slowing. The UAP flyby
+    # (SimulationWorld.inject_uap_flyby) is one, so that its closest approach
+    # to a magnetometer happens where and when it was asked to. It retires at
+    # retire_at_s on the world clock instead of by lifetime.
+    scripted: bool = False
+    retire_at_s: float | None = None
 
     @property
     def adsb_silent(self) -> bool:
@@ -486,6 +493,11 @@ class SimulationWorld:
         # proximity to count as a conflict.
         self.min_separation_km: float = 5.0
         self.min_vertical_sep_km: float = 0.6  # ~2000 ft
+
+    @property
+    def clock_s(self) -> float:
+        """Seconds of simulated time since the world was built."""
+        return self._time
 
     def add_node(self, config: NodeConfig):
         """Register a synthetic node in the simulation.
@@ -756,6 +768,64 @@ class SimulationWorld:
             scheduled += 1
         return scheduled
 
+    def inject_uap_flyby(
+        self,
+        lat: float,
+        lon: float,
+        *,
+        ground_alt_km: float = 0.0,
+        closest_approach_m: float = 600.0,
+        altitude_m: float = 300.0,
+        speed_mps: float = 120.0,
+        heading_deg: float = 90.0,
+        lead_s: float = 60.0,
+        name: str = "uap",
+    ) -> SimulatedAircraft:
+        """Fly a UAP past a point: an anomalous object on a straight, level
+        track whose horizontal closest approach to (lat, lon) is
+        ``closest_approach_m`` to the right of track, ``altitude_m`` above the
+        ground there, ``lead_s`` seconds from now.
+
+        It is an ordinary world object from then on: the radar nodes echo it
+        if it crosses a beam, the ground-truth push carries it as anomalous,
+        and magnetometers see it as a dipole. It has no transponder (a UAP is
+        unidentified by definition) and retires once it is as far past the
+        point as it started before it.
+        """
+        speed_km_s = speed_mps / 1000.0
+        heading_rad = math.radians(heading_deg)
+        along = (math.sin(heading_rad), math.cos(heading_rad))  # east, north
+        right = (math.cos(heading_rad), -math.sin(heading_rad))
+        run_km = speed_km_s * lead_s
+        cpa_km = closest_approach_m / 1000.0
+        east = right[0] * cpa_km - along[0] * run_km
+        north = right[1] * cpa_km - along[1] * run_km
+        start_lat, start_lon, _ = _enu_to_lla(east, north, 0.0, lat, lon, 0.0)
+        oid = f"{name}-{self._next_id:05d}"
+        self._next_id += 1
+        ac = SimulatedAircraft(
+            object_id=oid,
+            lat=start_lat,
+            lon=start_lon,
+            alt_km=ground_alt_km + altitude_m / 1000.0,
+            vel_east=along[0] * speed_km_s,
+            vel_north=along[1] * speed_km_s,
+            vel_up=0.0,
+            heading_deg=heading_deg % 360.0,
+            speed_km_s=speed_km_s,
+            base_speed_km_s=speed_km_s,
+            has_adsb=False,
+            is_anomalous=True,
+            object_type="anomalous",
+            created_at=self._time,
+            lifetime_s=float("inf"),
+            sim_now_s=self._time,
+            scripted=True,
+            retire_at_s=self._time + 2.0 * lead_s,
+        )
+        self.aircraft.append(ac)
+        return ac
+
     # Expired aircraft are retired only once they are at least this far from
     # the world center — a target vanishing overhead reads as a tracking bug
     # on the map, so retirement happens off at the edges, beyond the ~60 km
@@ -794,6 +864,8 @@ class SimulationWorld:
         ac.departing = True
 
     def _should_retire(self, ac: "SimulatedAircraft") -> bool:
+        if ac.retire_at_s is not None:
+            return self._time >= ac.retire_at_s
         age = self._time - ac.created_at
         if age < ac.lifetime_s:
             return False
@@ -950,6 +1022,11 @@ class SimulationWorld:
         if ac.alt_km <= 0.1 or ac.alt_km >= 15.0:
             ac.vel_up = 0.0
         ac.alt_km = max(0.1, min(ac.alt_km, 15.0))
+
+        if ac.scripted:
+            # Straight and level at its set velocity: no steering, no
+            # perturbation, so its path is exactly the one that was scripted.
+            return
 
         # ── Orbit anomaly: circle in place instead of following waypoints ────
         if ac.anomaly_event == "orbit" and ac.anomaly_fired:

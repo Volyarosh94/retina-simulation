@@ -40,6 +40,12 @@ from retina_simulation.generator import (
     generate_fleet,
 )
 from retina_simulation.live_adsb import LiveAdsbClient
+from retina_simulation.magnetometer import (
+    MagnetometerArray,
+    MagnetometerSettings,
+    build_magnetometer_push_payload,
+    uniform,
+)
 from retina_simulation.tower_resolver import apply_tower_assignments, resolve_towers
 from retina_simulation.world import (
     MetroCell,
@@ -248,8 +254,19 @@ class FleetOrchestrator:
         metro_traffic_frac: float = 0.6,
         cells: list[dict] | None = None,
         metro: str | None = None,
+        seed: int = 0,
+        magnetometers: int = 8,
+        mag_placement: str = "spread",
     ):
         self.node_configs = node_configs
+        self.seed = seed
+        # Magnetometers beside some radar receivers (magnetometer.py). The
+        # runtime config's mag_* keys take over from these at the first poll.
+        self.mag_settings = MagnetometerSettings(
+            enabled=magnetometers > 0, n_nodes=max(magnetometers, 0), placement=mag_placement
+        )
+        self.magnetometers: MagnetometerArray | None = None
+        self._last_flyby_seq = 0
         self.cells = cells or []
         self.metro = metro
         self.host = host
@@ -347,6 +364,13 @@ class FleetOrchestrator:
         if self.hub_radial and self.cells:
             self.world.metro_cells = _cells_to_metrocells(self.cells)
             self.world.frac_metro_traffic = self.metro_traffic_frac
+
+        self.magnetometers = MagnetometerArray(
+            node_configs=self.node_configs,
+            center=(center_lat, center_lon),
+            seed=self.seed,
+            settings=self.mag_settings,
+        )
 
         log.info(
             "SimulationWorld: center=(%.2f, %.2f), %d nodes, %d-%d aircraft, %d metro cells, waypoint net=%s (%d)",
@@ -1037,6 +1061,12 @@ async def _poll_simulation_config(
                 # turnover.
                 n_live_dark = orchestrator.world.set_frac_live_dark(float(cfg.get("frac_live_dark", 0.0)))
                 orchestrator.live_adsb_enabled = bool(cfg.get("live_adsb_enabled", True))
+                # Isolated: nothing about the magnetometers may stop the rest
+                # of this poll, the scene-change restart below included.
+                try:
+                    apply_magnetometer_config(orchestrator, cfg, time.time())
+                except Exception as e:
+                    log.warning("Magnetometer config not applied: %s", e)
                 last_updated_at = updated_at
                 log.info(
                     "Simulation config updated: anomalous=%.2f drone=%.2f dark=%.2f adsb_outage=%.2f "
@@ -1092,6 +1122,139 @@ async def _poll_simulation_config(
                     return
         except Exception as e:
             log.debug("Config poll failed: %s", e)
+
+
+# A flyby request older than this when the fleet first sees it is not acted on:
+# it is one the fleet saw before a restart, or one it missed while down, and a
+# UAP appearing minutes after the click that asked for it reads as a bug.
+FLYBY_MAX_AGE_S = 120.0
+
+
+def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: float):
+    """Apply the runtime config's mag_* keys and any new UAP flyby request.
+
+    Node count and placement re-place the magnetometers in-process: unlike the
+    radar nodes they hold no TCP session, so nothing needs a fleet restart.
+    Returns the injected flyby object, if any.
+    """
+    array = getattr(orchestrator, "magnetometers", None)
+    if array is None or orchestrator.world is None:
+        return None
+    settings = MagnetometerSettings.from_config(cfg, array.settings)
+    if array.apply(settings, now):
+        log.info(
+            "Magnetometers: %d node(s), %s placement%s",
+            len(array.nodes),
+            settings.placement,
+            "" if settings.enabled else " (disabled)",
+        )
+    request = cfg.get("mag_flyby")
+    if not isinstance(request, dict):
+        return None
+    seq = request.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= orchestrator._last_flyby_seq:
+        return None
+    orchestrator._last_flyby_seq = seq
+    requested_at = request.get("requested_at")
+    if not isinstance(requested_at, (int, float)) or now - requested_at > FLYBY_MAX_AGE_S:
+        log.info("Ignoring stale UAP flyby request #%d", seq)
+        return None
+    if not array.nodes:
+        log.warning("UAP flyby #%d requested with no magnetometers placed", seq)
+        return None
+    target = next((n for n in array.nodes if request.get("node_id") in (n.node_id, n.host_node_id)), None)
+    if target is None:
+        target = array.nodes[int(uniform(orchestrator.seed, "flyby-target", seq) * len(array.nodes))]
+
+    def number(key, default, low, high):
+        value = request.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
+            return default
+        return float(value)
+
+    heading = request.get("heading_deg")
+    if isinstance(heading, bool) or not isinstance(heading, (int, float)):
+        heading = 360.0 * uniform(orchestrator.seed, "flyby-heading", seq)
+    ac = orchestrator.world.inject_uap_flyby(
+        target.lat,
+        target.lon,
+        ground_alt_km=target.alt_m / 1000.0,
+        closest_approach_m=number("closest_approach_m", 600.0, 0.0, 20_000.0),
+        altitude_m=number("altitude_m", 300.0, 50.0, 15_000.0),
+        speed_mps=number("speed_mps", 120.0, 5.0, 1000.0),
+        heading_deg=float(heading),
+        lead_s=number("lead_s", 60.0, 10.0, 600.0),
+    )
+    log.info(
+        "UAP flyby #%d: %s passes %s (%s) in %.0f s",
+        seq,
+        ac.object_id,
+        target.node_id,
+        target.host_node_id,
+        number("lead_s", 60.0, 10.0, 600.0),
+    )
+    return ac
+
+
+async def _push_magnetometers_live(
+    orchestrator: FleetOrchestrator,
+    base_url: str,
+    poll_s: float = 0.25,
+    push_interval_s: float = 1.0,
+    hold_s: float = 10.0,
+):
+    """Sample the magnetometers once per world tick and push the readings.
+
+    Sampling follows the world clock — one reading per step, which is when
+    objects move — rather than this loop's timer, so a slow push can neither
+    duplicate nor skip a tick. If a push fails its readings go with the next
+    one, up to hold_s old; older ones are dropped, and the server sees a gap.
+    """
+    import urllib.request
+
+    url = f"{base_url}/api/sim/magnetometer/push"
+    loop = asyncio.get_event_loop()
+    ssl_context = None
+    if "localhost" in base_url or "127.0.0.1" in base_url:
+        ssl_context = ssl._create_unverified_context()  # noqa: S323 — unverified context only for the localhost/127.0.0.1 dev path above
+    log.info("Magnetometer push started (url=%s)", url)
+    last_clock = None
+    last_push = 0.0
+    pending: list[tuple[int, list[dict]]] = []
+    while orchestrator._running:
+        await asyncio.sleep(poll_s)
+        world, array = orchestrator.world, orchestrator.magnetometers
+        if world is None or array is None:
+            continue
+        if world.clock_s != last_clock:
+            last_clock = world.clock_s
+            if array.nodes:
+                now = time.time()
+                anomalous = [ac for ac in world.aircraft if ac.object_type == "anomalous"]
+                pending.append((int(now * 1000), array.sample(anomalous, now)))
+        if time.monotonic() - last_push < push_interval_s:
+            continue
+        last_push = time.monotonic()
+        cutoff = int((time.time() - hold_s) * 1000)
+        pending = [batch for batch in pending if batch[0] >= cutoff]
+        try:
+            body = json.dumps(build_magnetometer_push_payload(array, pending)).encode()
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    **({"X-API-Key": _k} if (_k := os.environ.get("RADAR_API_KEY", "")) else {}),
+                },
+                method="POST",
+            )
+            await loop.run_in_executor(
+                None,
+                lambda r=req, ctx=ssl_context: urllib.request.urlopen(r, timeout=3, context=ctx),
+            )
+            pending = []
+        except Exception as e:
+            log.debug("Magnetometer push failed: %s", e)
 
 
 async def _push_adsb_live(
@@ -1318,6 +1481,9 @@ async def main_async(args):
         metro_traffic_frac=args.metro_traffic_frac,
         cells=cells,
         metro=getattr(args, "metro", None),
+        seed=args.seed,
+        magnetometers=getattr(args, "magnetometers", 8),
+        mag_placement=getattr(args, "mag_placement", "spread"),
     )
 
     # Build shared simulation world
@@ -1362,6 +1528,11 @@ async def main_async(args):
                 interval_s=2.0,
             )
         )
+
+    # Magnetometer readings, one per world tick, for the server's detector and
+    # the /sim map. Nothing to send without a server to send it to.
+    if args.validation_url:
+        tasks.append(_push_magnetometers_live(orchestrator, args.validation_url))
 
     # Poll server for updated simulation physics fractions (set from frontend UI).
     if args.validation_url:
@@ -1550,6 +1721,19 @@ def main():
         type=float,
         default=5.0,
         help="Seconds between live feed polls (min 1)",
+    )
+    parser.add_argument(
+        "--magnetometers",
+        type=int,
+        default=8,
+        help="Magnetometers to place beside radar receive sites (0 = none). "
+        "The backend's mag_n_nodes takes over at the first config poll.",
+    )
+    parser.add_argument(
+        "--mag-placement",
+        choices=("spread", "core", "random"),
+        default="spread",
+        help="How to choose the sites that get a magnetometer (see magnetometer.choose_sites)",
     )
     parser.add_argument(
         "--no-hub-radial",
