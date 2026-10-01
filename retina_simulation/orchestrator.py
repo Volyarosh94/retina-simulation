@@ -1613,6 +1613,14 @@ async def main_async(args):
     summary = fleet_summary(all_nodes)
     log.info("Summary: %s", json.dumps(summary, indent=2))
 
+    # The magnetometers' draws follow the seed the fleet was generated with,
+    # which the generator stamps into the config it writes: fleet-entrypoint.sh
+    # gives --seed to the generator, not to this process. Without a stamp (a
+    # fleet generated here, or a config from before stamps) --seed stands in.
+    fleet_seed = scene.get("seed") if scene else None
+    if isinstance(fleet_seed, bool) or not isinstance(fleet_seed, int):
+        fleet_seed = args.seed
+
     orchestrator = FleetOrchestrator(
         node_configs=all_nodes,
         host=args.host,
@@ -1630,7 +1638,7 @@ async def main_async(args):
         metro_traffic_frac=args.metro_traffic_frac,
         cells=cells,
         metro=getattr(args, "metro", None),
-        seed=args.seed,
+        seed=fleet_seed,
         magnetometers=getattr(args, "magnetometers", 8),
         mag_placement=getattr(args, "mag_placement", "spread"),
     )
@@ -1775,7 +1783,13 @@ def main():
     parser.add_argument("--config", type=str, default="fleet_config.json", help="Path to fleet_config.json")
     parser.add_argument("--nodes", type=int, default=0, help="Number of nodes to use (0 = all from config)")
     parser.add_argument("--regions", type=str, default="us", help="Regions for auto-generation: us,eu,au")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for fleet generation")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for fleet generation, which the magnetometers follow too. "
+        "A --config from the generator carries the seed it was generated with, which wins.",
+    )
     parser.add_argument(
         "--n-cluster",
         "--n-ring",

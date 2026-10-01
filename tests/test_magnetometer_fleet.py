@@ -11,6 +11,7 @@ import itertools
 import json
 import logging
 import random
+import sys
 import threading
 import time
 from collections import deque
@@ -436,3 +437,32 @@ class TestConfigPoll:
         assert orch.world.frac_anomalous == 0.3
         assert stops == [True]  # the scene change still restarts the fleet
         assert any(r.getMessage() == "Magnetometer config not applied: bad mag_flyby" for r in caplog.records)
+
+
+class TestSeed:
+    @staticmethod
+    def built_from(monkeypatch, tmp_path, config, *argv):
+        """The orchestrator main() builds from ``config``; main_async stops
+        there, as it does when no node connects."""
+        path = tmp_path / "fleet_config.json"
+        path.write_text(json.dumps(config))
+        built = []
+
+        async def connect_nothing(self):
+            built.append(self)
+
+        monkeypatch.setattr(FleetOrchestrator, "connect_all", connect_nothing)
+        monkeypatch.setattr(sys, "argv", ["orchestrator", "--config", str(path), *argv])
+        orchestrator_module.main()
+        return built[0]
+
+    def test_the_magnetometers_follow_the_seed_the_config_was_generated_with(self, monkeypatch, tmp_path):
+        # fleet-entrypoint.sh gives the generator --seed and the orchestrator
+        # none, so the stamp is the only place the fleet's seed is found.
+        scene = {"n_nodes": 4, "dual_fraction": 0.0, "layout": "ring", "seed": 7}
+        orch = self.built_from(monkeypatch, tmp_path, {"fleet": {"scene": scene}, "nodes": RADARS}, "--seed", "3")
+        assert orch.seed == 7 and orch.magnetometers.seed == 7
+
+    def test_without_a_stamp_they_follow_the_seed_flag(self, monkeypatch, tmp_path):
+        orch = self.built_from(monkeypatch, tmp_path, {"nodes": RADARS}, "--seed", "9")
+        assert orch.seed == 9 and orch.magnetometers.seed == 9
