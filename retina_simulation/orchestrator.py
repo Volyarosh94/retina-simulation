@@ -27,9 +27,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import ssl
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 # Add parent dir so we can import simulation packages
@@ -44,6 +46,7 @@ from retina_simulation.magnetometer import (
     MagnetometerArray,
     MagnetometerSettings,
     build_magnetometer_push_payload,
+    main_field_nt,
     uniform,
 )
 from retina_simulation.tower_resolver import apply_tower_assignments, resolve_towers
@@ -87,6 +90,14 @@ def _cells_to_metrocells(cell_dicts: list[dict]) -> list[MetroCell]:
 RETINA_VERSION = "1.0"
 HEARTBEAT_INTERVAL_S = 60
 CONFIG_ACK_TIMEOUT_S = 10
+# World steps of magnetometer readings kept while pushes fail, to go with the
+# next one that gets through: ten seconds at one step a second. A longer
+# outage leaves the server a gap in the data rather than a backlog.
+MAGNETOMETER_HOLD_STEPS = 10
+# A magnetometer reading that fails is logged at once, then at most this often:
+# one cause would otherwise log at every world step. The STATS line carries
+# the running count in between.
+MAGNETOMETER_ERROR_LOG_S = 60.0
 
 
 def _config_hash(cfg: dict) -> str:
@@ -266,6 +277,12 @@ class FleetOrchestrator:
             enabled=magnetometers > 0, n_nodes=max(magnetometers, 0), placement=mag_placement
         )
         self.magnetometers: MagnetometerArray | None = None
+        # One batch of magnetometer readings per world step, oldest first, as
+        # (timestamp_ms, readings). The simulation loop fills it and
+        # _push_magnetometers_live drains it, so a slow or failed push costs
+        # no reading. Bounded: past MAGNETOMETER_HOLD_STEPS the oldest go.
+        self.magnetometer_readings: deque[tuple[int, list[dict]]] = deque(maxlen=MAGNETOMETER_HOLD_STEPS)
+        self._magnetometer_error_logged_at: float | None = None
         self._last_flyby_at = 0.0
         self.cells = cells or []
         self.metro = metro
@@ -296,6 +313,7 @@ class FleetOrchestrator:
             "handshake_ok": 0,
             "start_time": 0,
             "errors": 0,
+            "magnetometer_errors": 0,
         }
         # Ground truth storage for validation
         self.ground_truth: list[dict] = []
@@ -370,6 +388,20 @@ class FleetOrchestrator:
             center=(center_lat, center_lon),
             seed=self.seed,
             settings=self.mag_settings,
+        )
+        # The main-field model loads on the first reading, which comes only
+        # once every node has connected. Load it now, so an environment that
+        # cannot says so at startup. Either way the radar fleet runs: each
+        # reading is isolated (_sample_magnetometers).
+        try:
+            main_field_nt(center_lat, center_lon, 0.0, time.time())
+        except Exception as e:
+            log.warning("Magnetometers cannot read: the WMM2025 main-field model did not load (%s)", e)
+        log.info(
+            "Magnetometers: %d node(s), %s placement, seed %d",
+            len(self.magnetometers.nodes),
+            self.mag_settings.placement,
+            self.seed,
         )
 
         log.info(
@@ -467,6 +499,33 @@ class FleetOrchestrator:
         if len(self.ground_truth) > 1000:
             self.ground_truth = self.ground_truth[-500:]
 
+    def _sample_magnetometers(self, timestamp_ms: int):
+        """Read every magnetometer at this world step, for the push to send.
+
+        Called once per step, stamped with the step's own time, so the
+        readings follow the world clock whatever the push is doing. Nothing
+        here may stop the radar fleet: a reading that fails is counted in
+        the stats, logged (at once, then at most once a minute), and skipped.
+        """
+        array = self.magnetometers
+        if self.world is None or array is None or not array.nodes:
+            return
+        try:
+            anomalous = [ac for ac in self.world.aircraft if ac.object_type == "anomalous"]
+            self.magnetometer_readings.append((timestamp_ms, array.sample(anomalous, timestamp_ms / 1000.0)))
+        except Exception as e:
+            self._stats["magnetometer_errors"] += 1
+            now = time.monotonic()
+            first = self._magnetometer_error_logged_at is None
+            if first or now - self._magnetometer_error_logged_at >= MAGNETOMETER_ERROR_LOG_S:
+                self._magnetometer_error_logged_at = now
+                log.warning(
+                    "Magnetometer reading failed (%d so far); the radar fleet carries on: %s",
+                    self._stats["magnetometer_errors"],
+                    e,
+                    exc_info=first,
+                )
+
     async def _send_frame_to_node(self, node_id: str, frame: dict):
         """Send a detection frame to a single node connection."""
         conn = self.connections.get(node_id)
@@ -545,7 +604,7 @@ class FleetOrchestrator:
 
             await asyncio.sleep(check_interval_s)
 
-    async def run_simulation_loop(self, duration_s: float = 0):
+    async def run_simulation_loop(self, duration_s: float = 0, tick_dt: float = 1.0):
         """Main simulation loop — step world continuously, send frames staggered.
 
         The world now advances every ``tick_dt=1s`` (multiplied by time_scale)
@@ -558,7 +617,6 @@ class FleetOrchestrator:
         """
         self._running = True
         self._stats["start_time"] = time.monotonic()
-        tick_dt = 1.0  # world advances this many real-seconds per loop iteration
         report_interval = 10  # log stats every N seconds
         last_report = time.monotonic()
 
@@ -604,8 +662,10 @@ class FleetOrchestrator:
                 self.world.step(tick_dt * self.time_scale, mode=self.mode)
                 timestamp_ms = int(time.time() * 1000)
 
-                # Record ground truth on every world step
+                # Record ground truth on every world step, and read the
+                # magnetometers at the same instant.
                 self._record_ground_truth(timestamp_ms)
+                self._sample_magnetometers(timestamp_ms)
 
                 # Send frames only to nodes whose per-node cooldown has elapsed
                 now_t = time.monotonic()
@@ -633,7 +693,7 @@ class FleetOrchestrator:
                     dps = self._stats["total_detections"] / max(elapsed, 1)
                     log.info(
                         "STATS: %.0fs elapsed | %d active nodes | %d frames (%.0f/s) | "
-                        "%d detections (%.0f/s) | %d errors | %d aircraft",
+                        "%d detections (%.0f/s) | %d errors | %d magnetometer errors | %d aircraft",
                         elapsed,
                         active,
                         self._stats["total_frames"],
@@ -641,6 +701,7 @@ class FleetOrchestrator:
                         self._stats["total_detections"],
                         dps,
                         self._stats["errors"],
+                        self._stats["magnetometer_errors"],
                         len(self.world.aircraft) if self.world else 0,
                     )
                     last_report = now_t
@@ -1205,20 +1266,53 @@ def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: f
     return ac
 
 
+def _refusal_reason(error) -> str:
+    """What the server said when it refused a push: the ``detail`` of its JSON
+    body (a string from our routes, a list from FastAPI's request
+    validation), or else the HTTP status line. Kept to one line's worth."""
+    try:
+        detail = json.loads(error.read()).get("detail")
+    except Exception:
+        detail = None
+    if detail in (None, "", []):
+        reason = f"{error.code} {error.reason}"
+    else:
+        reason = detail if isinstance(detail, str) else json.dumps(detail)
+    return reason[:300]
+
+
+class _PushRefused(Exception):
+    """The server refused a magnetometer push outright: a 4xx other than 408
+    (request timeout) or 429 (too many requests). The same readings sent
+    again would be refused again."""
+
+    def __init__(self, error):
+        self.status = error.code
+        self.reason = _refusal_reason(error)
+        super().__init__(f"HTTP {self.status}: {self.reason}")
+
+
 async def _push_magnetometers_live(
     orchestrator: FleetOrchestrator,
     base_url: str,
-    poll_s: float = 0.25,
-    push_interval_s: float = 1.0,
-    hold_s: float = 10.0,
+    interval_s: float = 1.0,
 ):
-    """Sample the magnetometers once per world tick and push the readings.
+    """Post the magnetometer readings to the server once a second.
 
-    Sampling follows the world clock — one reading per step, which is when
-    objects move — rather than this loop's timer, so a slow push can neither
-    duplicate nor skip a tick. If a push fails its readings go with the next
-    one, up to hold_s old; older ones are dropped, and the server sees a gap.
+    The simulation loop reads the magnetometers once per world step into
+    orchestrator.magnetometer_readings (_sample_magnetometers); this only
+    sends what is there, one push at a time, from a thread, so waiting on the
+    server never holds up the world. A slow push delays readings without
+    losing any, as long as the server answers within the push's 3 s timeout:
+    the next push carries every step since the last one it answered.
+
+    A push that fails (no answer in time, a 5xx, a 408 or a 429) leaves its
+    readings for the next, up to MAGNETOMETER_HOLD_STEPS of them; older ones
+    are dropped, and the server sees a gap. A push the server refuses (any
+    other 4xx) is not sent again, since it would only be refused again: its
+    readings are dropped, and the server's reason is logged once per kind.
     """
+    import urllib.error
     import urllib.request
 
     url = f"{base_url}/api/sim/magnetometer/push"
@@ -1226,28 +1320,38 @@ async def _push_magnetometers_live(
     ssl_context = None
     if "localhost" in base_url or "127.0.0.1" in base_url:
         ssl_context = ssl._create_unverified_context()  # noqa: S323 — unverified context only for the localhost/127.0.0.1 dev path above
-    log.info("Magnetometer push started (url=%s)", url)
-    last_clock = None
-    last_push = 0.0
-    pending: list[tuple[int, list[dict]]] = []
-    while orchestrator._running:
-        await asyncio.sleep(poll_s)
-        world, array = orchestrator.world, orchestrator.magnetometers
-        if world is None or array is None:
-            continue
-        if world.clock_s != last_clock:
-            last_clock = world.clock_s
-            if array.nodes:
-                now = time.time()
-                anomalous = [ac for ac in world.aircraft if ac.object_type == "anomalous"]
-                pending.append((int(now * 1000), array.sample(anomalous, now)))
-        if time.monotonic() - last_push < push_interval_s:
-            continue
-        last_push = time.monotonic()
-        cutoff = int((time.time() - hold_s) * 1000)
-        pending = [batch for batch in pending if batch[0] >= cutoff]
+
+    def _post(req):
         try:
-            body = json.dumps(build_magnetometer_push_payload(array, pending)).encode()
+            with urllib.request.urlopen(req, timeout=3, context=ssl_context) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            # A refusal's reason is read here, off the event loop; either way
+            # the answer is closed.
+            try:
+                if 400 <= e.code < 500 and e.code not in (408, 429):
+                    raise _PushRefused(e) from e
+                raise
+            finally:
+                e.close()
+
+    log.info("Magnetometer push started (url=%s)", url)
+    pending = orchestrator.magnetometer_readings
+    failing_since = None
+    refusals: set[str] = set()
+    next_push = time.monotonic()
+    while orchestrator._running:
+        next_push += interval_s
+        await asyncio.sleep(max(0.0, next_push - time.monotonic()))
+        # A push that took longer than the interval is followed at once, not
+        # by a burst making up the seconds it took.
+        next_push = max(next_push, time.monotonic())
+        array = orchestrator.magnetometers
+        if array is None:
+            continue
+        batches = list(pending)
+        try:
+            body = json.dumps(build_magnetometer_push_payload(array, batches)).encode()
             req = urllib.request.Request(
                 url,
                 data=body,
@@ -1257,13 +1361,49 @@ async def _push_magnetometers_live(
                 },
                 method="POST",
             )
-            await loop.run_in_executor(
-                None,
-                lambda r=req, ctx=ssl_context: urllib.request.urlopen(r, timeout=3, context=ctx),
-            )
-            pending = []
+            await loop.run_in_executor(None, _post, req)
+        except _PushRefused as e:
+            refused = e
         except Exception as e:
-            log.debug("Magnetometer push failed: %s", e)
+            # Once per outage: past MAGNETOMETER_HOLD_STEPS it costs readings.
+            if failing_since is None:
+                failing_since = time.monotonic()
+                log.warning(
+                    "Magnetometer push failing; holding the last %d steps of readings: %s",
+                    pending.maxlen,
+                    e,
+                )
+            else:
+                log.debug("Magnetometer push failed: %s", e)
+            continue
+        else:
+            refused = None
+        # Answered: the server has these readings, or has refused them for
+        # good. Either way they are done with.
+        if failing_since is not None:
+            log.info("Magnetometer push recovered after %.0f s", time.monotonic() - failing_since)
+            failing_since = None
+        if refused is not None:
+            # Once per kind of reason. The server's reasons name fields by
+            # index and quote values, so one cause refusing push after push
+            # would read as a new reason every time; with the numbers taken
+            # out it reads as one. A server with something new to say each
+            # time is heard a hundred times, then only at debug.
+            kind = re.sub(r"\d+(?:\.\d+)?", "#", refused.reason)
+            if kind not in refusals and len(refusals) < 100:
+                refusals.add(kind)
+                log.warning(
+                    "Magnetometer push refused (HTTP %d); its readings are dropped, not sent again: %s",
+                    refused.status,
+                    refused.reason,
+                )
+            else:
+                log.debug("Magnetometer push refused: %s", refused)
+        # Readings taken while it was in flight wait for the next push.
+        if batches:
+            answered_ms = batches[-1][0]
+            while pending and pending[0][0] <= answered_ms:
+                pending.popleft()
 
 
 async def _push_adsb_live(
@@ -1538,8 +1678,9 @@ async def main_async(args):
             )
         )
 
-    # Magnetometer readings, one per world tick, for the server's detector and
-    # the /sim map. Nothing to send without a server to send it to.
+    # Magnetometer readings, taken once per world step by the simulation loop,
+    # for the server's detector and the /sim map. Nothing to send without a
+    # server to send it to.
     if args.validation_url:
         tasks.append(_push_magnetometers_live(orchestrator, args.validation_url))
 
