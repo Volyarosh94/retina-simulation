@@ -13,17 +13,23 @@ library itself, and the magnetometers.
 
 ## Working on it
 
+From a fresh clone, with uv:
+
 ```bash
-# retina-custody is on no package index; CI installs it the same way.
+uv venv --python 3.12 && source .venv/bin/activate
+# retina-custody is on no package index, so it comes from its repository.
 uv pip install "retina-custody @ git+https://github.com/offworldlabs/retina-custody@v0.1.0"
 uv pip install -e '.[dev]' pre-commit==4.6.2 vulture==2.14
 pre-commit run --all-files
 pytest
 ```
 
-The fleet runs against a local server as `python -m retina_simulation.orchestrator`.
-The flags are covered in retina-server's `docs/simulation.md`, under
-"Running the Fleet Locally".
+CI runs the same steps on Python 3.12, installing into the runner's own
+Python (`uv pip install --system`) rather than a virtual environment.
+
+The fleet runs against a local server as
+`python -m retina_simulation.orchestrator`. The flags are covered in
+retina-server's `docs/simulation.md`, under "Running the Fleet Locally".
 
 ## Magnetometer nodes
 
@@ -39,10 +45,10 @@ north, east and down axes:
 | Daily variation (Sq) | 4-harmonic solar-quiet model fitted to the FRD and BSL observatories on either side of Greenville, blended by season and solar cycle, with day-to-day variability | 30–90 nT peak to peak in its largest component (east) |
 | Storm | Optional (`mag_storm`). A sudden commencement, a main phase pulling north towards 0.72 · Dst (Dst −150 nT), exponential recovery, and Pc4–Pc5 pulsations. It is the same at every site. | ~110 nT at its deepest |
 | UAPs | Every anomalous object is a magnetic dipole of 1e9 A·m², with the field falling as 1/r³ | 200 nT at 1 km; 1,600 nT at 500 m |
-| Noise | Datasheet noise for the cycle count, then quantised to the chip's counts | 15 nT at 200 cycles, 13.3 nT per count |
+| Noise | Gaussian, then quantised to the chip's counts, so that the readings show the datasheet's noise for the cycle count | 15 nT at 200 cycles, 13.3 nT per count |
 
-Aircraft and drones contribute nothing. Their moments are far too small at
-these distances, which is the task's model.
+Aircraft and drones contribute nothing: in the model these nodes use, their
+moments are far too small to register at these distances.
 
 A UAP is any object the world spawned as `object_type == "anomalous"`. Its
 dipole points in a fixed direction drawn from the seed. The field is summed
@@ -52,25 +58,38 @@ under 0.002 nT.
 The noise figures (30, 20 and 15 nT at 50, 100 and 200 cycles) come from PNI's
 datasheet, table 3-1. They are interpolated log-log and extended by the
 nearest segment's slope, which gives ~11.3 nT at 400 cycles and ~8.4 nT at 800.
-The gain is PNI's 0.3671·CC + 1.5 counts per µT. These are the same figures,
-and the same physics, as the standalone
-[retina-magnetometer](https://github.com/Volyarosh94/retina-magnetometer)
-simulator. That simulator feeds a real node app over a simulated I2C bus;
-this one feeds the server.
+The gain is PNI's 0.3671·CC + 1.5 counts per µT. The table's figures are the
+noise of the chip's output, so they already hold its rounding to counts, a
+uniform error worth LSB²/12 of variance. The simulator therefore draws
+√(σ² − LSB²/12) before rounding (14.5 nT for 15 at 200 cycles), and its
+readings come out at the table's figure, which is also the noise the push
+reports for the sensor. These are the same figures, and the same physics, as
+the RM3100 simulator in retina-magnetometer, a separate repository with a
+node app for a real RM3100 and a register-level simulator of the chip. That
+simulator feeds the node app over a simulated I2C bus; this one feeds the
+server.
 
 ### Determinism
 
-The seed alone fixes:
+The fleet's seed alone fixes:
 
 - where the magnetometers sit;
 - each site's crust;
 - each UAP's dipole direction;
-- every noise sample.
+- every noise sample;
+- which magnetometer a flyby passes, and on what heading, when its request
+  does not say.
 
 These come from hashing the seed with a stream name and an index, never from
 the world's shared `random` module. Adding magnetometers therefore leaves the
 radar scene of a given seed exactly as it was. `tests/test_magnetometer.py`
-holds both properties.
+and `tests/test_magnetometer_fleet.py` hold both properties.
+
+The fleet's seed is the one the fleet was generated with. The generator
+stamps it into the config it writes, and the orchestrator takes it from
+there; `--seed` stands in only when the orchestrator generates the fleet
+itself or the config has no stamp. retina-server's fleet container passes
+its `FLEET_SEED` to the generator alone, so the stamp is where it is found.
 
 ### Placement
 
@@ -85,9 +104,14 @@ lowest node id there) and picks `mag_n_nodes` of them:
 
 ### What goes to the server
 
-Once a second the orchestrator posts the readings from each world step since
-the last post to `/api/sim/magnetometer/push`, with the simulator's key. This
-sits beside the ground-truth and ADS-B pushes. The radar TCP frames and
+The simulation loop reads every magnetometer once per world step, stamped
+with that step's time, as it records the step's ground truth. Once a second a
+push loop of its own posts the readings taken since the server last answered
+to `/api/sim/magnetometer/push`, with the simulator's key. It posts one at a
+time and from a thread, so waiting on the server never holds up the world.
+A slow server delays readings but costs none, as long as it answers within a
+post's 3 s timeout; a post it has not answered by then has failed (below).
+This sits beside the ground-truth and ADS-B pushes. The radar TCP frames and
 `/v1/nodes` are untouched.
 
 ```jsonc
@@ -109,9 +133,23 @@ sits beside the ground-truth and ADS-B pushes. The radar TCP frames and
 The `truth` rows are there to score detections, never to make them. The
 server's detector reads only `samples`.
 
-If a post fails, the orchestrator keeps the last 10 s of readings and sends
-them with the next post. An outage longer than that leaves a gap in the data;
-it does not build a backlog.
+A post fails when the server does not answer in time, or answers with a 5xx,
+a 408 or a 429. Its readings then wait for the next post, up to the last ten
+world steps (10 s). An outage longer than that leaves a gap in the data; it
+does not build a backlog. The orchestrator logs a warning when posts start
+failing and a line when they recover.
+
+A post the server refuses, with any other 4xx, is not sent again: the same
+readings would only be refused again, and would hold back every reading after
+them until the hold dropped them all. Its readings are dropped, and the
+server's reason (the `detail` of its answer) is logged as a warning, once for
+each kind of reason.
+
+A reading that fails, in an environment missing `pygeomag` for instance, is
+skipped and counted as `magnetometer_errors`, in the fleet's stats and its
+STATS log line. It is logged at once, then at most once a minute. A
+main-field model that cannot load is also reported at startup. Nothing about
+the magnetometers stops the radar fleet.
 
 ### Runtime settings
 
@@ -129,8 +167,8 @@ magnetometers hold no connection of their own.
 
 Changing the count or the placement re-places the magnetometers at once. The
 cycle count changes the noise from the next reading on. The server also owns
-`mag_threshold_sigma` and `mag_common_mode`, which set how it detects and
-never reach the simulator.
+`mag_threshold_sigma` and `mag_common_mode`, which set how it detects. They
+reach the simulator with the rest of the polled config, and it ignores them.
 
 The `--magnetometers N` and `--mag-placement` flags set the starting values.
 The server's keys take over at the first poll.
@@ -141,18 +179,25 @@ The server's keys take over at the first poll.
 magnetometer: a straight, level pass with a given closest approach, altitude,
 speed and heading (random if not given). It reaches its closest point `lead_s`
 seconds after the fleet picks the request up, and the fleet polls every 5 s.
-The server's `POST /api/sim/magnetometers/flyby` writes the request. The
-usual way in is the Physics Layer page (`/sim/physics`), or the button in a
-magnetometer's panel on the `/sim` map.
+The line is straight on the flat plane around the magnetometer, the plane the
+magnetometer measures distance in, so the pass comes as close as asked at any
+speed and lead. The server's `POST /api/sim/magnetometers/flyby` writes the
+request. The usual way in is the Physics Layer page (`/sim/physics`), or the
+button in a magnetometer's panel on the `/sim` map.
 
-- **Once each.** The fleet flies each request once, and tells a new request
-  from one it has flown by the time it was made. Requests also carry a
-  number, but the server starts counting again when it restarts, and a fleet
-  that kept running must not take every later request for an old one. A
-  request replaced by a newer one before the next poll is not flown.
-- **Staleness.** A request more than two minutes old when the fleet first
-  sees it is ignored. This stops a fleet that restarts from replaying the
-  last pass.
+- **Once each.** A running fleet flies each request once, and tells a new
+  request from one it has flown by the time it was made. Requests also carry
+  a number, but the server starts counting again when it restarts, and a
+  fleet that kept running must not take every later request for an old one.
+  A request replaced by a newer one before the next poll is not flown.
+- **Staleness and restarts.** A request more than two minutes old when the
+  fleet first sees it is ignored. That age is also all that keeps a restarted
+  fleet from flying the last request again: the fleet remembers nothing
+  across a restart, and the server goes on serving the last request. A
+  restarted fleet whose first poll comes within two minutes of a request (a
+  scene change right after the click, say) flies it again, in a new world
+  where the first pass, finished or not, no longer exists. One back later
+  than that does not.
 - **What the pass is.** An ordinary anomalous world object on a scripted
   track, with no transponder. The radar nodes echo it when it crosses a beam,
   and the ground-truth push carries it. It retires once it is as far past the
