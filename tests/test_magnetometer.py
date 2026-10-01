@@ -45,6 +45,14 @@ class Obj:
     alt_km: float
 
 
+def horizontal_km(obj, point):
+    """Horizontal distance from ``point`` (lat, lon), on the flat plane around
+    it that a magnetometer there measures distance in."""
+    north = math.radians(obj.lat - point[0]) * 6371.0
+    east = math.radians(obj.lon - point[1]) * 6371.0 * math.cos(math.radians(point[0]))
+    return math.hypot(north, east)
+
+
 class TestPhysics:
     def test_dipole_task_numbers(self):
         m = (1e9, 0.0, 0.0)
@@ -243,6 +251,65 @@ class TestFlyby:
         world.step(1.0)
         assert ac not in world.aircraft  # retired a lead time after the pass
 
+    @pytest.mark.parametrize("speed_mps", [120.0, 500.0, 1000.0])
+    @pytest.mark.parametrize("heading_deg", [45.0, 135.0, 225.0, 315.0])
+    def test_a_long_diagonal_pass_comes_as_close_as_asked(self, speed_mps, heading_deg):
+        # Ten minutes of lead on a diagonal is where stepping longitude by the
+        # cosine of the latitude reached so far bent the track off its line:
+        # across these cases, 600 m asked for came out at 499 m to 8.1 km.
+        world = SimulationWorld(center_lat=34.85, center_lon=-82.39)
+        world.min_aircraft = world.max_aircraft = 0
+        target = (34.85, -82.39)
+        ac = world.inject_uap_flyby(
+            *target, closest_approach_m=600, speed_mps=speed_mps, heading_deg=heading_deg, lead_s=600
+        )
+        state = random.getstate()
+        track = []
+        while True:
+            world.step(1.0)
+            if ac not in world.aircraft:
+                break
+            track.append((world.clock_s, horizontal_km(ac, target)))
+        assert world.clock_s == pytest.approx(1200.0)  # as far past as it started before
+        t_closest, closest = min(track, key=lambda p: p[1])
+        assert closest == pytest.approx(0.6, abs=0.001)
+        assert t_closest == pytest.approx(600.0)
+        # On its line and at its speed at every step, not just the closest.
+        for t, d in track:
+            assert d == pytest.approx(math.hypot(0.6, speed_mps * (t - 600.0) / 1000.0), rel=1e-6)
+        assert random.getstate() == state
+
+    def test_the_magnetometer_sees_the_pass_that_was_asked_for(self):
+        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+
+        orch = FleetOrchestrator(
+            node_configs=[{**c, "tx_lat": 34.0, "tx_lon": -82.0, "tx_alt_ft": 1000, "fc_hz": 1e8} for c in FLEET],
+            seed=1,
+        )
+        orch._build_world()
+        orch.world.min_aircraft = orch.world.max_aircraft = 0
+        target = orch.magnetometers.nodes[0]
+        request = {
+            "seq": 1,
+            "requested_at": T0,
+            "node_id": target.node_id,
+            "closest_approach_m": 600,
+            "altitude_m": 300,
+            "speed_mps": 500,
+            "heading_deg": 45,
+            "lead_s": 300,
+        }
+        ac = apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 1)
+        truth = []
+        for _ in range(599):
+            orch.world.step(1.0)
+            readings = orch.magnetometers.sample([ac], T0 + orch.world.clock_s)
+            truth.append((next(r for r in readings if r["node"] is target)["nearest_uap_km"], orch.world.clock_s))
+        # 600 m out and 300 m up, 300 s on: what the magnetometer's own truth records.
+        slant_km, at_s = min(truth)
+        assert slant_km == pytest.approx(math.hypot(0.6, 0.3), abs=1e-6)
+        assert at_s == pytest.approx(300.0)
+
     def test_orchestrator_applies_a_fresh_request_once(self):
         from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
 
@@ -262,6 +329,24 @@ class TestFlyby:
         assert apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 2) is None  # the same request
         stale = {**request, "seq": 4, "requested_at": T0 - 1000}
         assert apply_magnetometer_config(orch, {"mag_flyby": stale}, T0 + 3) is None
+
+    def test_a_fleet_back_within_two_minutes_flies_the_last_request_again(self):
+        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+
+        # A restarted fleet remembers no request, and the server still serves
+        # the last one: only its age keeps it from being flown again.
+        def restarted_fleet():
+            orch = FleetOrchestrator(
+                node_configs=[{**c, "tx_lat": 34.0, "tx_lon": -82.0, "tx_alt_ft": 1000, "fc_hz": 1e8} for c in FLEET],
+                seed=1,
+            )
+            orch._build_world()
+            return orch
+
+        request = {"seq": 7, "requested_at": T0, "closest_approach_m": 500}
+        assert apply_magnetometer_config(restarted_fleet(), {"mag_flyby": request}, T0 + 2) is not None
+        assert apply_magnetometer_config(restarted_fleet(), {"mag_flyby": request}, T0 + 119) is not None
+        assert apply_magnetometer_config(restarted_fleet(), {"mag_flyby": request}, T0 + 121) is None
 
     def test_a_request_numbered_afresh_by_a_restarted_server_is_still_flown(self):
         from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config

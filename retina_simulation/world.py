@@ -226,10 +226,19 @@ class SimulatedAircraft:
     # A scripted object flies a fixed straight line at constant speed: no
     # waypoints, no erratic manoeuvres, no separation slowing. The UAP flyby
     # (SimulationWorld.inject_uap_flyby) is one, so that its closest approach
-    # to a magnetometer happens where and when it was asked to. It retires at
-    # retire_at_s on the world clock instead of by lifetime.
-    scripted: bool = False
+    # to a magnetometer happens where and when it was asked to. The line lies
+    # on the flat east/north plane around track_origin (lat, lon): the object
+    # is at track_start_km (east, north) at created_at and moves from there at
+    # its vel_east/vel_north. It retires at retire_at_s on the world clock
+    # instead of by lifetime.
+    track_origin: tuple[float, float] | None = None
+    track_start_km: tuple[float, float] = (0.0, 0.0)
     retire_at_s: float | None = None
+
+    @property
+    def scripted(self) -> bool:
+        """True for an object on a fixed line (track_origin) rather than a route."""
+        return self.track_origin is not None
 
     @property
     def adsb_silent(self) -> bool:
@@ -786,6 +795,11 @@ class SimulationWorld:
         ``closest_approach_m`` to the right of track, ``altitude_m`` above the
         ground there, ``lead_s`` seconds from now.
 
+        The track is a straight line on the flat east/north plane around
+        (lat, lon), the plane a magnetometer there measures distance in, so
+        the pass comes exactly as close as asked, exactly when asked, at any
+        speed and lead.
+
         It is an ordinary world object from then on: the radar nodes echo it
         if it crosses a beam, the ground-truth push carries it as anomalous,
         and magnetometers see it as a dipole. It has no transponder (a UAP is
@@ -820,11 +834,32 @@ class SimulationWorld:
             created_at=self._time,
             lifetime_s=float("inf"),
             sim_now_s=self._time,
-            scripted=True,
+            track_origin=(lat, lon),
+            track_start_km=(east, north),
             retire_at_s=self._time + 2.0 * lead_s,
         )
         self.aircraft.append(ac)
         return ac
+
+    def _fly_scripted(self, ac: SimulatedAircraft) -> None:
+        """Put a scripted object where its line has it at this world time.
+
+        Placed from the time elapsed since it was created, not stepped like
+        other traffic: stepping longitude by the cosine of the latitude
+        reached so far bends a diagonal track off its line, by 100 m over a
+        ten-minute lead at 120 m/s and by kilometres at higher speeds, and
+        the closest approach moves with it. No steering, no perturbation, and
+        level at the altitude it was given.
+        """
+        elapsed = self._time - ac.created_at
+        ac.lat, ac.lon, _ = _enu_to_lla(
+            ac.track_start_km[0] + ac.vel_east * elapsed,
+            ac.track_start_km[1] + ac.vel_north * elapsed,
+            0.0,
+            ac.track_origin[0],
+            ac.track_origin[1],
+            0.0,
+        )
 
     # Expired aircraft are retired only once they are at least this far from
     # the world center — a target vanishing overhead reads as a tracking bug
@@ -993,6 +1028,9 @@ class SimulationWorld:
             # somewhere the real aircraft is not.
             self._dead_reckon(ac, dt)
             return
+        if ac.scripted:
+            self._fly_scripted(ac)
+            return
 
         # ── Fire scheduled mid-flight anomaly event ──────────────────────────
         if ac.anomaly_event and not ac.anomaly_fired and self._time >= ac.anomaly_trigger_at:
@@ -1022,11 +1060,6 @@ class SimulationWorld:
         if ac.alt_km <= 0.1 or ac.alt_km >= 15.0:
             ac.vel_up = 0.0
         ac.alt_km = max(0.1, min(ac.alt_km, 15.0))
-
-        if ac.scripted:
-            # Straight and level at its set velocity: no steering, no
-            # perturbation, so its path is exactly the one that was scripted.
-            return
 
         # ── Orbit anomaly: circle in place instead of following waypoints ────
         if ac.anomaly_event == "orbit" and ac.anomaly_fired:

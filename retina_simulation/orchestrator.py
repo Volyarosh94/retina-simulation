@@ -1125,8 +1125,11 @@ async def _poll_simulation_config(
 
 
 # A flyby request older than this when the fleet first sees it is not acted on:
-# it is one the fleet saw before a restart, or one it missed while down, and a
-# UAP appearing minutes after the click that asked for it reads as a bug.
+# a UAP appearing minutes after the click that asked for it reads as a bug. It
+# is also all that keeps a restarted fleet, which remembers nothing, from
+# flying the last request again: the server goes on serving it, so a fleet
+# back within this time of it (a scene change right after the click) does fly
+# it again, in a new world where the first pass no longer exists.
 FLYBY_MAX_AGE_S = 120.0
 
 
@@ -1155,9 +1158,10 @@ def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: f
     requested_at = request.get("requested_at")
     if isinstance(requested_at, bool) or not isinstance(requested_at, (int, float)):
         return None
-    # Each request is flown once. Its time says whether it is new, not its
-    # number: the server numbers requests afresh when it restarts, and a fleet
-    # that kept running would take every request after that for an old one.
+    # A running fleet flies each request once (a restarted one: see
+    # FLYBY_MAX_AGE_S). Its time says whether it is new, not its number: the
+    # server numbers requests afresh when it restarts, and a fleet that kept
+    # running would take every request after that for an old one.
     if requested_at <= orchestrator._last_flyby_at:
         return None
     orchestrator._last_flyby_at = requested_at
