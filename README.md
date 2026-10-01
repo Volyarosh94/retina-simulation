@@ -153,9 +153,10 @@ the magnetometers stops the radar fleet.
 
 ### Runtime settings
 
-The orchestrator applies the runtime configuration's `mag_*` keys at each
-config poll, in-process. No fleet restart is needed, because the
-magnetometers hold no connection of their own.
+The orchestrator applies the runtime configuration's `mag_*` keys in-process,
+at the first config poll after the server stamps a change (the config's
+`_updated_at`), as it does every other setting. No fleet restart is needed,
+because the magnetometers hold no connection of their own.
 
 | Key | Default | Effect |
 | --- | --- | --- |
@@ -177,19 +178,27 @@ The server's keys take over at the first poll.
 
 `mag_flyby` in the runtime configuration asks the fleet to fly one UAP past one
 magnetometer: a straight, level pass with a given closest approach, altitude,
-speed and heading (random if not given). It reaches its closest point `lead_s`
-seconds after the fleet picks the request up, and the fleet polls every 5 s.
-The line is straight on the flat plane around the magnetometer, the plane the
-magnetometer measures distance in, so the pass comes as close as asked at any
-speed and lead. The server's `POST /api/sim/magnetometers/flyby` writes the
-request. The usual way in is the Physics Layer page (`/sim/physics`), or the
-button in a magnetometer's panel on the `/sim` map.
+speed and heading (random if not given). The line is straight on the flat
+plane around the magnetometer, the plane the magnetometer measures distance
+in, so the pass comes as close as asked at any speed and lead.
 
-- **Once each.** A running fleet flies each request once, and tells a new
-  request from one it has flown by the time it was made. Requests also carry
-  a number, but the server starts counting again when it restarts, and a
-  fleet that kept running must not take every later request for an old one.
-  A request replaced by a newer one before the next poll is not flown.
+The server's `POST /api/sim/magnetometers/flyby` writes the request into the
+config the fleet polls every 5 s, and leaves the config's `_updated_at` stamp
+alone: a flyby is a command, not a setting, and a moved stamp would read on
+the Physics Layer page as someone else's change. So the fleet looks for a
+request at every poll, not only when the stamp moves, and the pass reaches
+its closest point `lead_s` seconds after the poll that picks it up. A poll
+that also changes settings applies them first, so a request can name a
+magnetometer the same poll places. The usual way in is the Physics Layer
+page (`/sim/physics`), or the button in a magnetometer's panel on the `/sim`
+map.
+
+- **Once each.** A running fleet flies each request once, however many polls
+  serve it, and tells a new request from one it has flown by the time it was
+  made. Requests also carry a number, but the server starts counting again
+  when it restarts, and a fleet that kept running must not take every later
+  request for an old one. A request replaced by a newer one before the next
+  poll is not flown.
 - **Staleness and restarts.** A request more than two minutes old when the
   fleet first sees it is ignored. That age is also all that keeps a restarted
   fleet from flying the last request again: the fleet remembers nothing

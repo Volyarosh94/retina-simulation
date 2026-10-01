@@ -1057,6 +1057,10 @@ async def _poll_simulation_config(
 ):
     """Poll /api/simulation/config every interval_s and apply updated spawn fractions to world.
 
+    Settings, the magnetometers' mag_* keys among them, are applied when the
+    config's _updated_at stamp moves. A UAP flyby request (mag_flyby) is a
+    command rather than a setting, so it is looked for at every poll.
+
     Also watches for a scene change (n_nodes / dual_fraction): those are
     baked into the fleet at container boot (see generator.py), so unlike the
     spawn fractions above they cannot be applied in-process. When ``scene``
@@ -1125,9 +1129,9 @@ async def _poll_simulation_config(
                 # Isolated: nothing about the magnetometers may stop the rest
                 # of this poll, the scene-change restart below included.
                 try:
-                    apply_magnetometer_config(orchestrator, cfg, time.time())
+                    apply_magnetometer_settings(orchestrator, cfg, time.time())
                 except Exception as e:
-                    log.warning("Magnetometer config not applied: %s", e)
+                    log.warning("Magnetometer settings not applied: %s", e)
                 last_updated_at = updated_at
                 log.info(
                     "Simulation config updated: anomalous=%.2f drone=%.2f dark=%.2f adsb_outage=%.2f "
@@ -1181,6 +1185,15 @@ async def _poll_simulation_config(
                     )
                     await orchestrator.stop()
                     return
+            # A flyby is a command, not a setting, and the server leaves the
+            # stamp alone for one, so it is looked for at every poll; a
+            # request served again is not flown again. It comes after the
+            # settings, which may place the magnetometer it names, and is
+            # isolated like them.
+            try:
+                fly_requested_pass(orchestrator, cfg, time.time())
+            except Exception as e:
+                log.warning("UAP flyby not flown: %s", e)
         except Exception as e:
             log.debug("Config poll failed: %s", e)
 
@@ -1194,16 +1207,15 @@ async def _poll_simulation_config(
 FLYBY_MAX_AGE_S = 120.0
 
 
-def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: float):
-    """Apply the runtime config's mag_* keys and any new UAP flyby request.
+def apply_magnetometer_settings(orchestrator: FleetOrchestrator, cfg: dict, now: float):
+    """Apply the runtime config's mag_* settings keys.
 
     Node count and placement re-place the magnetometers in-process: unlike the
     radar nodes they hold no TCP session, so nothing needs a fleet restart.
-    Returns the injected flyby object, if any.
     """
     array = getattr(orchestrator, "magnetometers", None)
-    if array is None or orchestrator.world is None:
-        return None
+    if array is None:
+        return
     settings = MagnetometerSettings.from_config(cfg, array.settings)
     if array.apply(settings, now):
         log.info(
@@ -1212,6 +1224,19 @@ def apply_magnetometer_config(orchestrator: FleetOrchestrator, cfg: dict, now: f
             settings.placement,
             "" if settings.enabled else " (disabled)",
         )
+
+
+def fly_requested_pass(orchestrator: FleetOrchestrator, cfg: dict, now: float):
+    """Fly the UAP pass the config's ``mag_flyby`` asks for, if it is new.
+
+    A flyby is a command, not a setting: the server goes on serving the last
+    request without moving the config's stamp, and the poll calls this every
+    time. Seeing a request again changes nothing. Returns the injected
+    object, if any.
+    """
+    array = getattr(orchestrator, "magnetometers", None)
+    if array is None or orchestrator.world is None:
+        return None
     request = cfg.get("mag_flyby")
     if not isinstance(request, dict):
         return None

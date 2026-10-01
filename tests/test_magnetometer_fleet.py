@@ -22,6 +22,7 @@ import pytest
 
 from retina_simulation import orchestrator as orchestrator_module
 from retina_simulation.orchestrator import (
+    FLYBY_MAX_AGE_S,
     MAGNETOMETER_ERROR_LOG_S,
     MAGNETOMETER_HOLD_STEPS,
     FleetOrchestrator,
@@ -384,43 +385,98 @@ class FakeConfigResponse:
         return False
 
 
-def poll_once(monkeypatch, orch, cfg, scene=None):
-    """One cycle of the fleet's config poll, serving ``cfg``."""
+def poll(monkeypatch, orch, *configs, scene=None, observe=lambda: None):
+    """Cycles of the fleet's config poll, serving ``configs`` one per cycle.
+    Returns ``observe()`` as it stood before each fetch, which is what the
+    cycle before it left."""
     import urllib.request
 
+    served = list(configs)
+    observed = []
+
     def fake_urlopen(url, context=None, timeout=None):
-        orch._running = False  # this cycle is the last
+        observed.append(observe())
+        cfg = served.pop(0)
+        if not served:
+            orch._running = False  # this cycle is the last
         return FakeConfigResponse(cfg)
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     orch._running = True
     asyncio.run(_poll_simulation_config(orch, "http://validation.example", interval_s=0.0, scene=scene))
+    return observed
+
+
+def flyby_request(requested_at, **request):
+    return {"seq": 1, "requested_at": requested_at, **request}
+
+
+def passes(orch):
+    return [ac for ac in orch.world.aircraft if ac.scripted]
 
 
 class TestConfigPoll:
-    def test_a_poll_applies_the_magnetometer_keys_and_flies_the_requested_pass(self, monkeypatch):
+    def test_a_flyby_is_flown_though_the_config_stamp_never_moves(self, monkeypatch):
+        # A flyby is a command, not a setting: the server leaves the config's
+        # stamp alone for one, so the fleet has to see it without it.
         orch = fleet()
+        settings = {"_updated_at": 1.0, "mag_n_nodes": 3}
+        request = flyby_request(time.time(), node_id=orch.magnetometers.nodes[0].node_id)
+        poll(monkeypatch, orch, settings, *[{**settings, "mag_flyby": request}] * 4)
+        assert len(passes(orch)) == 1  # flown, and once, over the four polls that served it
+
+    def test_the_settings_keys_still_apply_only_when_the_stamp_moves(self, monkeypatch):
+        orch = fleet()
+        counts = poll(
+            monkeypatch,
+            orch,
+            {"_updated_at": 1.0, "mag_n_nodes": 2},
+            {"_updated_at": 1.0, "mag_n_nodes": 4},  # the same stamp: not a change
+            {"_updated_at": 2.0, "mag_n_nodes": 4},
+            observe=lambda: len(orch.magnetometers.nodes),
+        )
+        assert counts == [3, 2, 2] and len(orch.magnetometers.nodes) == 4
+
+    def test_settings_apply_before_the_flyby_that_comes_with_them(self, monkeypatch):
+        # A pass asked of a magnetometer that the same poll places.
+        orch = fleet()
+        placed = {n.host_node_id for n in orch.magnetometers.nodes}
+        newcomer = next(r for r in RADARS if r["node_id"] not in placed)
         cfg = {
             "_updated_at": 1.0,
             "mag_n_nodes": 4,
             "mag_placement": "core",
             "mag_cycle_count": 400,
-            "mag_flyby": {"seq": 1, "requested_at": time.time(), "node_id": "mag-synth-A", "lead_s": 30},
+            "mag_flyby": flyby_request(time.time(), node_id=f"mag-{newcomer['node_id']}", lead_s=30),
         }
-        poll_once(monkeypatch, orch, cfg)
+        poll(monkeypatch, orch, cfg)
         settings = orch.magnetometers.settings
         assert (len(orch.magnetometers.nodes), settings.placement, settings.cycle_count) == (4, "core", 400)
-        passes = [ac for ac in orch.world.aircraft if ac.scripted]
-        assert len(passes) == 1 and passes[0].object_type == "anomalous"
-        assert passes[0].track_origin == (34.85, -82.39)  # past synth-A's magnetometer
+        assert [ac.track_origin for ac in passes(orch)] == [(newcomer["rx_lat"], newcomer["rx_lon"])]
+        assert passes(orch)[0].object_type == "anomalous"
+
+    def test_a_stale_request_is_never_flown_however_often_it_is_served(self, monkeypatch):
+        orch = fleet()
+        cfg = {"_updated_at": 1.0, "mag_flyby": flyby_request(time.time() - FLYBY_MAX_AGE_S - 1)}
+        poll(monkeypatch, orch, cfg, cfg, cfg)
+        assert passes(orch) == []
+
+    def test_a_restarted_fleet_flies_the_last_request_again_while_it_is_fresh(self, monkeypatch):
+        # The server goes on serving the last request, and a restarted fleet
+        # remembers nothing: back within two minutes, it flies it again.
+        cfg = {"_updated_at": 1.0, "mag_flyby": flyby_request(time.time())}
+        before_restart, after_restart = fleet(), fleet()
+        poll(monkeypatch, before_restart, cfg, cfg)
+        poll(monkeypatch, after_restart, cfg, cfg)
+        assert len(passes(before_restart)) == 1 and len(passes(after_restart)) == 1
 
     def test_the_servers_detector_keys_reach_the_fleet_and_change_nothing(self, monkeypatch):
         orch = fleet()
         before = (orch.magnetometers.settings, [n.node_id for n in orch.magnetometers.nodes])
-        poll_once(monkeypatch, orch, {"_updated_at": 1.0, "mag_threshold_sigma": 4.0, "mag_common_mode": False})
+        poll(monkeypatch, orch, {"_updated_at": 1.0, "mag_threshold_sigma": 4.0, "mag_common_mode": False})
         assert (orch.magnetometers.settings, [n.node_id for n in orch.magnetometers.nodes]) == before
 
-    def test_a_magnetometer_failure_leaves_the_rest_of_the_poll_alone(self, monkeypatch, caplog):
+    def test_a_magnetometer_settings_failure_leaves_the_rest_of_the_poll_alone(self, monkeypatch, caplog):
         orch = fleet()
         stops = []
 
@@ -428,15 +484,33 @@ class TestConfigPoll:
             stops.append(True)
 
         def broken(*args):
-            raise RuntimeError("bad mag_flyby")
+            raise RuntimeError("bad mag_placement")
 
         monkeypatch.setattr(orch, "stop", stop)
-        monkeypatch.setattr(orchestrator_module, "apply_magnetometer_config", broken)
+        monkeypatch.setattr(orchestrator_module, "apply_magnetometer_settings", broken)
         with caplog.at_level(logging.WARNING, logger="fleet"):
-            poll_once(monkeypatch, orch, {"_updated_at": 1.0, "frac_anomalous": 0.3, "max_range_km": 75.0})
+            poll(monkeypatch, orch, {"_updated_at": 1.0, "frac_anomalous": 0.3, "max_range_km": 75.0})
         assert orch.world.frac_anomalous == 0.3
         assert stops == [True]  # the scene change still restarts the fleet
-        assert any(r.getMessage() == "Magnetometer config not applied: bad mag_flyby" for r in caplog.records)
+        assert any(r.getMessage() == "Magnetometer settings not applied: bad mag_placement" for r in caplog.records)
+
+    def test_a_flyby_that_fails_leaves_the_poll_running(self, monkeypatch, caplog):
+        orch = fleet()
+
+        def broken(*args):
+            raise RuntimeError("no such magnetometer")
+
+        monkeypatch.setattr(orchestrator_module, "fly_requested_pass", broken)
+        with caplog.at_level(logging.WARNING, logger="fleet"):
+            poll(
+                monkeypatch,
+                orch,
+                {"_updated_at": 1.0, "mag_flyby": flyby_request(time.time())},
+                {"_updated_at": 2.0, "frac_anomalous": 0.3, "mag_n_nodes": 4},
+            )
+        # The next poll still came, and applied its settings.
+        assert orch.world.frac_anomalous == 0.3 and len(orch.magnetometers.nodes) == 4
+        assert any(r.getMessage() == "UAP flyby not flown: no such magnetometer" for r in caplog.records)
 
 
 class TestSeed:

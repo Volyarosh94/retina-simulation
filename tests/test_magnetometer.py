@@ -308,7 +308,7 @@ class TestFlyby:
         assert random.getstate() == state
 
     def test_the_magnetometer_sees_the_pass_that_was_asked_for(self):
-        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+        from retina_simulation.orchestrator import FleetOrchestrator, fly_requested_pass
 
         orch = FleetOrchestrator(
             node_configs=[{**c, "tx_lat": 34.0, "tx_lon": -82.0, "tx_alt_ft": 1000, "fc_hz": 1e8} for c in FLEET],
@@ -327,7 +327,7 @@ class TestFlyby:
             "heading_deg": 45,
             "lead_s": 300,
         }
-        ac = apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 1)
+        ac = fly_requested_pass(orch, {"mag_flyby": request}, T0 + 1)
         truth = []
         for _ in range(599):
             orch.world.step(1.0)
@@ -339,7 +339,7 @@ class TestFlyby:
         assert at_s == pytest.approx(300.0)
 
     def test_orchestrator_applies_a_fresh_request_once(self):
-        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+        from retina_simulation.orchestrator import FleetOrchestrator, fly_requested_pass
 
         orch = FleetOrchestrator(
             node_configs=[{**c, "tx_lat": 34.0, "tx_lon": -82.0, "tx_alt_ft": 1000, "fc_hz": 1e8} for c in FLEET],
@@ -352,14 +352,14 @@ class TestFlyby:
             "node_id": orch.magnetometers.nodes[1].node_id,
             "closest_approach_m": 500,
         }
-        ac = apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 1)
+        ac = fly_requested_pass(orch, {"mag_flyby": request}, T0 + 1)
         assert ac is not None and ac in orch.world.aircraft
-        assert apply_magnetometer_config(orch, {"mag_flyby": request}, T0 + 2) is None  # the same request
+        assert fly_requested_pass(orch, {"mag_flyby": request}, T0 + 2) is None  # the same request
         stale = {**request, "seq": 4, "requested_at": T0 - 1000}
-        assert apply_magnetometer_config(orch, {"mag_flyby": stale}, T0 + 3) is None
+        assert fly_requested_pass(orch, {"mag_flyby": stale}, T0 + 3) is None
 
     def test_a_fleet_back_within_two_minutes_flies_the_last_request_again(self):
-        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+        from retina_simulation.orchestrator import FleetOrchestrator, fly_requested_pass
 
         # A restarted fleet remembers no request, and the server still serves
         # the last one: only its age keeps it from being flown again.
@@ -372,12 +372,12 @@ class TestFlyby:
             return orch
 
         request = {"seq": 7, "requested_at": T0, "closest_approach_m": 500}
-        assert apply_magnetometer_config(restarted_fleet(), {"mag_flyby": request}, T0 + 2) is not None
-        assert apply_magnetometer_config(restarted_fleet(), {"mag_flyby": request}, T0 + 119) is not None
-        assert apply_magnetometer_config(restarted_fleet(), {"mag_flyby": request}, T0 + 121) is None
+        assert fly_requested_pass(restarted_fleet(), {"mag_flyby": request}, T0 + 2) is not None
+        assert fly_requested_pass(restarted_fleet(), {"mag_flyby": request}, T0 + 119) is not None
+        assert fly_requested_pass(restarted_fleet(), {"mag_flyby": request}, T0 + 121) is None
 
     def test_a_request_numbered_afresh_by_a_restarted_server_is_still_flown(self):
-        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+        from retina_simulation.orchestrator import FleetOrchestrator, fly_requested_pass
 
         orch = FleetOrchestrator(
             node_configs=[{**c, "tx_lat": 34.0, "tx_lon": -82.0, "tx_alt_ft": 1000, "fc_hz": 1e8} for c in FLEET],
@@ -385,13 +385,13 @@ class TestFlyby:
         )
         orch._build_world()
         first = {"seq": 5, "requested_at": T0, "closest_approach_m": 500}
-        assert apply_magnetometer_config(orch, {"mag_flyby": first}, T0 + 1) is not None
+        assert fly_requested_pass(orch, {"mag_flyby": first}, T0 + 1) is not None
         # The server restarted and counts from one again; the fleet did not.
         after_restart = {"seq": 1, "requested_at": T0 + 30, "closest_approach_m": 500}
-        assert apply_magnetometer_config(orch, {"mag_flyby": after_restart}, T0 + 31) is not None
+        assert fly_requested_pass(orch, {"mag_flyby": after_restart}, T0 + 31) is not None
 
     def test_orchestrator_replaces_magnetometers_from_config(self):
-        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_config
+        from retina_simulation.orchestrator import FleetOrchestrator, apply_magnetometer_settings
 
         orch = FleetOrchestrator(
             node_configs=[{**c, "tx_lat": 34.0, "tx_lon": -82.0, "tx_alt_ft": 1000, "fc_hz": 1e8} for c in FLEET],
@@ -400,7 +400,7 @@ class TestFlyby:
         )
         orch._build_world()
         assert len(orch.magnetometers.nodes) == 2
-        apply_magnetometer_config(orch, {"mag_n_nodes": 4, "mag_placement": "core"}, T0)
+        apply_magnetometer_settings(orch, {"mag_n_nodes": 4, "mag_placement": "core"}, T0)
         assert len(orch.magnetometers.nodes) == 4
-        apply_magnetometer_config(orch, {"mag_enabled": False}, T0)
+        apply_magnetometer_settings(orch, {"mag_enabled": False}, T0)
         assert orch.magnetometers.nodes == []
