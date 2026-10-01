@@ -54,7 +54,7 @@ def horizontal_km(obj, point):
 
 
 class TestPhysics:
-    def test_dipole_task_numbers(self):
+    def test_dipole_field_at_one_and_five_km(self):
         m = (1e9, 0.0, 0.0)
         assert math.dist(mag.dipole_field_nt(m, (1000, 0, 0)), (0, 0, 0)) == pytest.approx(200.0)
         assert math.dist(mag.dipole_field_nt(m, (5000, 0, 0)), (0, 0, 0)) == pytest.approx(1.6)
@@ -134,15 +134,43 @@ class TestReadings:
             values = [r[axis] for r in readings]
             expected = background[axis] + node.crust_nt[axis] + mag.sq_variation_nt(T0 + 750, -82.39, seed=1)[axis]
             assert statistics.fmean(values) == pytest.approx(expected, abs=8)
-            # Datasheet noise plus 13.35 nT quantisation steps.
-            assert statistics.pstdev(values) == pytest.approx(math.hypot(15.0, 13.35 / math.sqrt(12)), rel=0.08)
+            # The datasheet's output noise, rounding to 13.35 nT counts included.
+            assert statistics.pstdev(values) == pytest.approx(15.0, rel=0.08)
+
+    @pytest.mark.parametrize("cycle_count", [50, 200, 800])
+    def test_output_noise_is_the_datasheets_figure(self, cycle_count):
+        # PNI's Table 3-1 is the noise of the chip's output, rounding to counts
+        # included. Quantised readings at one instant, where only the noise
+        # moves, must show that figure, not the figure plus the rounding: that
+        # came out 11 % high at 50 cycles and 3 % at 200 (at 800 a count is too
+        # fine to matter). 15 magnetometers, 3 axes and 2,000 readings measure
+        # it to about 0.25 %.
+        sites = [radar(f"synth-N{k:02d}", 34.85 + 0.02 * (k % 5), -82.39 + 0.02 * (k // 5)) for k in range(15)]
+        a = MagnetometerArray(
+            node_configs=sites,
+            center=(34.85, -82.39),
+            seed=1,
+            settings=MagnetometerSettings(n_nodes=15, cycle_count=cycle_count),
+        )
+        draws = [a.sample([], T0) for _ in range(2000)]
+        variances = [
+            statistics.pvariance([d[node]["reading"][axis] for d in draws]) for node in range(15) for axis in range(3)
+        ]
+        assert math.sqrt(statistics.fmean(variances)) == pytest.approx(mag.rm3100_noise_nt(cycle_count), rel=0.01)
+
+    def test_input_noise_leaves_room_for_the_rounding(self, monkeypatch):
+        lsb_nt = 1000.0 / mag.rm3100_gain_counts_per_ut(200)
+        assert mag.rm3100_input_noise_nt(200) == pytest.approx(math.sqrt(15.0**2 - lsb_nt**2 / 12.0))
+        assert mag.rm3100_input_noise_nt(200) == pytest.approx(14.50, abs=0.01)
+        # A figure too small to hold the rounding leaves nothing to add, rather
+        # than the square root of a negative number.
+        monkeypatch.setattr(mag, "rm3100_noise_nt", lambda cycle_count: 1.0)
+        assert mag.rm3100_input_noise_nt(200) == 0.0
 
     def test_cycle_count_changes_the_noise(self):
         a = array(n=1, cycle_count=800)
         values = [a.sample([], T0 + k)[0]["reading"][0] for k in range(1500)]
-        assert statistics.pstdev(values) == pytest.approx(
-            math.hypot(mag.rm3100_noise_nt(800), 3.39 / math.sqrt(12)), rel=0.1
-        )
+        assert statistics.pstdev(values) == pytest.approx(mag.rm3100_noise_nt(800), rel=0.1)
 
     def test_uap_overhead_adds_the_dipole_field_and_truth(self):
         a = array(n=1)

@@ -9,13 +9,14 @@ north/east/down:
       + daily (Sq)     the solar-quiet variation, the same shape at every site
       + storm          when switched on, common to the whole network
       + UAPs           every anomalous object as a 1e9 A·m² dipole, 1/r³
-      + noise          the RM3100's datasheet noise for its cycle count,
-                       then quantised to the chip's counts
+      + noise          the RM3100's, then quantised to the chip's counts:
+                       the output shows the datasheet's noise for its
+                       cycle count, which includes that rounding
 
-Aircraft and drones contribute nothing: their moments are too small to matter
-at these distances, which is the task's model. A "UAP" is an object the world
-spawned as ``object_type == "anomalous"``; an airliner that turns anomalous
-mid-flight (hijack, spoof...) is still an airliner.
+Aircraft and drones contribute nothing: in the model these nodes use, their
+moments are too small to matter at these distances. A "UAP" is an object the
+world spawned as ``object_type == "anomalous"``; an airliner that turns
+anomalous mid-flight (hijack, spoof...) is still an airliner.
 
 Nothing here draws from the world's shared ``random`` module. Placement,
 crust, dipole directions and noise are pure functions of the fleet seed, so
@@ -42,7 +43,7 @@ Vec = tuple[float, float, float]
 # μ0/4π in T·m/A, and nT per tesla.
 MU0_OVER_4PI = 1e-7
 TESLA_TO_NT = 1e9
-# The task's UAP model: a magnetic dipole of this moment.
+# A UAP, as these nodes model it: a magnetic dipole of this moment.
 UAP_MOMENT_AM2 = 1e9
 # Beyond this slant range a 1e9 A·m² dipole is under 0.002 nT on its axis:
 # nothing a 13 nT-per-count sensor could register.
@@ -58,7 +59,10 @@ PLACEMENTS = ("spread", "core", "random")
 # ── RM3100 characteristics (PNI UM16 Table 3-1) ──────────────────────────────
 # The same figures the retina-magnetometer node app uses: noise 30/20/15 nT at
 # 50/100/200 cycles, interpolated log-log and extended by the nearest segment's
-# slope (11.3 nT at 400, 8.4 at 800); gain from PNI's formula.
+# slope (11.3 nT at 400, 8.4 at 800); gain from PNI's formula. The table's
+# noise is that of the chip's output, so it already includes the rounding to
+# counts: the readings get rm3100_input_noise_nt before they are rounded, and
+# come out at the table's figure.
 
 _NOISE_POINTS = ((50, 30.0), (100, 20.0), (200, 15.0))
 
@@ -74,6 +78,16 @@ def rm3100_noise_nt(cycle_count: int) -> float:
 
 def rm3100_gain_counts_per_ut(cycle_count: int) -> float:
     return 0.3671 * cycle_count + 1.5
+
+
+def rm3100_input_noise_nt(cycle_count: int) -> float:
+    """The noise to add before rounding to counts, so that the rounded output
+    shows the datasheet's figure: rounding adds a uniform error of up to half
+    a count, LSB²/12 of variance, which the table's figure already holds. At
+    200 cycles, 14.5 nT in for 15 out. Floored at zero, should one count ever
+    be too coarse for the table's figure to hold its rounding."""
+    lsb_nt = 1000.0 / rm3100_gain_counts_per_ut(cycle_count)
+    return math.sqrt(max(0.0, rm3100_noise_nt(cycle_count) ** 2 - lsb_nt**2 / 12.0))
 
 
 # ── Deterministic randomness ─────────────────────────────────────────────────
@@ -465,7 +479,7 @@ class MagnetometerArray:
         magnitude and the object nearest the node, with its slant range.
         """
         self._tick += 1
-        sigma = rm3100_noise_nt(self.settings.cycle_count)
+        sigma = rm3100_input_noise_nt(self.settings.cycle_count)
         gain = rm3100_gain_counts_per_ut(self.settings.cycle_count)
         storm = self.storm(t) if self.storm is not None else (0.0, 0.0, 0.0)
         sq_centre = sq_variation_nt(t, self.center[1], f107=self.f107, seed=self.seed)
